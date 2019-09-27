@@ -1,0 +1,76 @@
+#coding=utf-8
+import os,time
+import smtplib
+from email.mime.text import MIMEText
+from email.utils import formataddr
+from pyspark.sql.types import *
+from pyspark.sql import SparkSession
+from pyspark import SparkConf
+from pyspark import SparkContext
+from pyspark.sql import HiveContext
+from pyspark.sql.window import Window
+from pyspark.sql import Row, functions as F
+
+
+os.environ["PYSPARK_PYTHON"] = "/usr/bin/python3"
+os.environ["PYSPARK_DRIVER_PYTHON"] = "/usr/bin/python3"
+dt = str(time.strftime("%Y%m%d", time.localtime(time.time()-3600*24)))
+
+
+def view(df,hive_context):
+    data_list = []
+    df = df.where('event["event_id"]="view" and event["source"] in (1,3,4)').selectExpr('event.source','event.post_id','event.end_time-event.start_time as time')
+    for i in (1,3,4):
+        data = df.where(f'source={i}').select('source','post_id','time').sort('time')
+        a,b,c,d = data.approxQuantile('time',[0.0,0.1,0.9,1.0],0)
+        data = data.where(f'time={a} or time={b} or time={c} or time={d}').dropDuplicates(['time']).withColumn('time',data.time.cast(IntegerType())).sort('time')
+        data = data.join(hive_context.sql('select a.post_id,a.title,a.description,c.name from (select post_id,title,description from prod_bd_mysql_syn.dim_post_info) a left join (select post_id,tag_id from prod_bd_mysql_syn.dim_post_tag) b on a.post_id=b.post_id left join (select id,name from prod_bd_mysql_syn.dim_tag_info) c on b.tag_id=c.id'),['post_id'],'left').rdd.map(lambda x: ((str(x.source),str(int(x.time)),str(x.post_id),str(x.title)[:20],str(x.description)[:50]),str(x.name))).reduceByKey(lambda x,y:str(x)+','+str(y)).collect()
+        for i in data:
+            i = list(i)
+            i.append((0 if int(i[0][1]) == int(a) else 1 if int(i[0][1]) == int(b) else 2 if int(i[0][1]) == int(c) else 3))
+            source = "发现页:1" if int(i[0][0])==1 else "关注页:2}" if int(i[0][0])==2 else "全屏视频播放页:3" if int(i[0][0])==3 else f"发现单列:4"
+            ratio = ("1%" if int(i[2])==0 else "10%" if int(i[2])==1 else "90%" if int(i[2])==2 else "100%")
+            data_list.append(f'<tr><td>{"事件:view"}</td><td>{source}</td><td>{str(i[0][1])}秒</td><td>{ratio}</td><td>{i[0][2]}</td><td>{i[0][3]}</td<td>{i[0][4]}</td><td>{i[1]}</td>></tr>\n')
+    return data_list
+
+def play(df):
+    data_list = []
+    df = df.where('event["event_id"]="play" and event["source"] in (3,4)').selectExpr('event.source','event.post_id','event.play_duration*1 as duration')
+    for i in range(3,4):
+        data = df.where(f'source={i}').select('source','post_id','duration').sort('duration')
+        try:
+            a,b,c,d = data.approxQuantile('duration',[0.0,0.1,0.9,1.0],0)
+            data_list.append(data.where(f'duration={a} or duration={b} or duration={c} or duration={d}').dropDuplicates(['duration']).sort('duration').collect())
+        except:pass
+    play_data = []
+    for i in data_list:
+        for index,datas in enumerate(i):
+            source = f"发现页:{datas['source']}" if int(datas["source"])==1 else f"关注页:{datas['source']}" if int(datas["source"])==2 else f"全屏视频播放页:{datas['source']}" if int(datas["source"])==3 else f"发现单列:{datas['source']}"
+            ratio = ("1%" if index==0 else "10%" if index==1 else "90%" if index==2 else "100%")
+            play_data.append(f'<tr><td>{"事件:play"}</td><td>{source}</td><td>{str(int(datas["duration"])//1000)+"秒"}</td><td>{ratio}</td><td>{datas["post_id"]}</td></tr>\n')
+    return play_data
+
+def main():
+    conf = SparkConf().setMaster("yarn-client").setAppName('count_time').set('spark.executorEnv.PYTHONHASHSEED','0')
+    spark = SparkSession.builder.config(conf=conf).enableHiveSupport().getOrCreate()
+    sc = spark.sparkContext
+    hive_context = HiveContext(sc)
+    all_data_sql = f"select event from prod_bd_app_log.dwv_bd_app_log where dt = {dt}"
+    df = hive_context.sql(all_data_sql)
+    table = ''.join(view(df,hive_context)+play(df))
+    text = f'''
+            <table border="1" width="100%" bgcolor="#e9faff">
+               <th colspan="5" align="center">{dt}曝光时长播放时长报表</td>
+               <tr align="center">
+                   <th>事件名称</th>
+                   <th>页面来源</th>
+                   <th>时长</th>
+                   <th>百分位</th>
+                   <th>贴子ID</th>
+               </tr>{''.join(table)}
+           </table>
+            '''
+    with open('/mnt/bigdata_workspace/pyspark/prod/bd_send_email/time.txt','w') as f:
+        f.write(text)
+
+main()
